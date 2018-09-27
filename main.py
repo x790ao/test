@@ -1,22 +1,16 @@
-import pandas as pd
-
-from openpyxl import Workbook, load_workbook
-
 import time
+from datetime import datetime, date
 
+import pandas as pd
+import win32com.client
+from openpyxl import load_workbook
 from selenium import webdriver
-from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.firefox.options import Options
-
-from datetime import datetime, date
-from datetime import timedelta
-
-import win32com.client
 
 
 def send_report(table, office):
@@ -72,6 +66,7 @@ tr:nth-child(even) {background-color: #f2f2f2;}
 
 
 def open_bond_page(tn, branch, from_port, to_port, goods_at, eta, eta_warehouse):
+    global ccn_change
     options = Options()
     options.add_argument("--headless")
     driver = webdriver.Firefox(firefox_options=options)
@@ -170,6 +165,30 @@ def open_bond_page(tn, branch, from_port, to_port, goods_at, eta, eta_warehouse)
     if elem.get_attribute('checked') == 'false':
         elem.click()
 
+    # change cargo control number if clear at the carrier
+    if ccn_change:
+        global mawb
+        elem = driver.find_element_by_xpath('//*[@id="btn:submit:changeCcn"]')
+        elem.click()
+
+        try:
+            elem = WebDriverWait(driver, delay).until(
+                EC.presence_of_element_located((By.XPATH, '//*[@id="newCcn"]')))
+        except TimeoutException:
+            print("Loading took too much time!")
+
+        elem = driver.find_element_by_xpath('//*[@id="newCcn"]')
+        elem.send_keys(mawb)
+
+        elem = driver.find_element_by_xpath('//*[@id="btn:submit:update"]')
+        elem.click()
+
+        try:
+            elem = WebDriverWait(driver, delay).until(
+                EC.presence_of_element_located((By.ID, 'btn:submit:save')))
+        except TimeoutException:
+            print("Loading took too much time!")
+
     elem = driver.find_element_by_id('btn:submit:save')
     elem.click()
 
@@ -190,7 +209,7 @@ def open_bond_page(tn, branch, from_port, to_port, goods_at, eta, eta_warehouse)
     return status
 
 
-def sublocation_checker(port, name):
+def cbsa_sublocation_checker(port, name):
     options = Options()
     options.add_argument("--headless")
     driver = webdriver.Firefox(firefox_options=options)
@@ -214,6 +233,79 @@ def sublocation_checker(port, name):
     return result
 
 
+def carrier_sublocation_checker(port, carrier, rule):
+    goods_at = ''
+    for line in range(13, 41):
+        try:
+            if carrier in rule['A' + str(line)].value:
+                goods_at_name = rule['B' + str(line)].value
+                try:
+                    goods_at = cbsa_sublocation_checker(port, goods_at_name)
+                    warning = ''
+                    global ccn_change
+                    ccn_change = True
+                except:
+                    warning = 'Can not get sublocation for %s, default used' % (goods_at_name)
+                    goods_at = rule['E4'].value
+                    goods_at_name = rule['E5'].value
+
+        except TypeError:
+            global ccn_change
+            ccn_change = False
+            goods_at = ''
+            warning = ''
+            goods_at_name = ''
+
+    if goods_at == '':
+        global ccn_change
+        ccn_change = True
+        warning = '%s sublocation missing, default used' % carrier
+        goods_at = rule['E4'].value
+        goods_at_name = rule['E5'].value
+
+    return [goods_at, goods_at_name, warning]
+
+
+def bso_sublocation_checker(port, bso, rule, carrier):
+    goods_at = ''
+    for line in range(2, 9):
+        if rule['A' + str(line)].value == bso:
+
+            goods_at_name = rule['B' + str(line)].value
+            warning = 'Sublocation from BSO'
+            if goods_at_name.lower() == 'carrier':
+                return carrier_sublocation_checker(port, carrier, rule)
+            try:
+                goods_at = cbsa_sublocation_checker(port, goods_at_name)
+            except:
+                warning = ' Cannnot get sublocation for %s, default used; ' % (goods_at_name)
+                goods_at = rule['E4'].value
+                goods_at_name = rule['E5'].value
+            return [goods_at, goods_at_name, warning]
+    if goods_at == '':
+        return False
+
+
+def customer_sublocation_checker(port, customer, rule, carrier):
+    goods_at = ''
+    for line in range(13, 41):
+        if consignee == rule['D' + str(line)].value:
+            goods_at_name = rule['E' + str(line)].value
+            if goods_at_name.lower() == 'carrier':
+                return carrier_sublocation_checker(port, carrier, rule)
+            try:
+                goods_at = cbsa_sublocation_checker(port, goods_at_name)
+                warning = 'Sublocation from Cnee'
+            except:
+                warning = 'Cannnot get sublocation for %s, default used' % (goods_at_name)
+                goods_at = rule['E4'].value
+                goods_at_name = rule['E5'].value
+            return [goods_at, goods_at_name, warning]
+
+    if goods_at == '':
+        return False
+
+
 if __name__ == '__main__':
 
     task_list = pd.read_csv('tasks.csv', error_bad_lines=False, encoding="ISO-8859-1", sep=';')
@@ -222,8 +314,9 @@ if __name__ == '__main__':
     table = {}
     for index, task in task_list.iterrows():
         errors = []
-        warning = ''
+        warnings = []
         goods_at = ''
+        ccn_change = False
 
         try:
             tn = str(int(task['Tracking Number']))
@@ -241,7 +334,7 @@ if __name__ == '__main__':
 
         except ValueError:
             atd = 'Missing'
-            warning = ', Missing ATD'
+            warnings.append('Missing ATD')
 
         weight = task['Weight']
         destination = task['Destination']
@@ -281,49 +374,24 @@ if __name__ == '__main__':
         from_port = rule['E1'].value
         to_port = rule['E1'].value
 
-        if weight < rule['E3'].value:
+        customer_result = customer_sublocation_checker(from_port, consignee, rule, carrier)
+        bso_result = bso_sublocation_checker(from_port, bso, rule, carrier)
+        if customer_result:
+            goods_at = customer_result[0]
+            goods_at_name = customer_result[1]
+            warnings.append(customer_result[2])
+        elif bso_result:
+            goods_at = bso_result[0]
+            goods_at_name = bso_result[1]
+            warnings.append(bso_result[2])
+        elif int(weight) > int(rule['E3'].value):
+            carrier_result = carrier_sublocation_checker(from_port, carrier, rule)
+            goods_at = carrier_result[0]
+            goods_at_name = carrier_result[1]
+            warnings.append(carrier_result[2])
+        else:
             goods_at = rule['E4'].value
             goods_at_name = rule['E5'].value
-        else:
-            for line in range(13, 41):
-                try:
-                    if carrier in rule['A' + str(line)].value:
-                        goods_at_name = rule['B' + str(line)].value
-                        try:
-                            goods_at = sublocation_checker(from_port, goods_at_name)
-                        except:
-                            warning += ' Cannnot get sublocation for %s, default used; ' % (rule)
-                            goods_at = rule['E4'].value
-                            goods_at_name = rule['E5'].value
-                except TypeError:
-                    goods_at = ''
-
-            if goods_at == '':
-                warning += ' %s sublocation missing, default used; ' % carrier
-                goods_at = rule['E4'].value
-                goods_at_name = rule['E5'].value
-
-        for line in range(2, 9):
-            if rule['A' + str(line)].value == bso:
-                goods_at_name = rule['B' + str(line)].value
-                warning += ' Sublocation from BSO; '
-                try:
-                    goods_at = sublocation_checker(from_port, goods_at_name)
-                except:
-                    warning += ' Cannnot get sublocation for %s, default used; ' % (goods_at_name)
-                    goods_at = rule['E4'].value
-                    goods_at_name = rule['E5'].value
-
-        for line in range(13, 41):
-            if consignee == rule['D' + str(line)].value:
-                goods_at_name = rule['E' + str(line)].value
-                try:
-                    goods_at = sublocation_checker(from_port, goods_at_name)
-                    warning += ' Sublocation from Cnee; '
-                except:
-                    warning += ' Cannnot get sublocation for %s, default used; ' % (goods_at_name)
-                    goods_at = rule['E4'].value
-                    goods_at_name = rule['E5'].value
 
         if errors:
             print('TN# %s processed, status: %s; ' % (tn, errors))
@@ -343,7 +411,10 @@ if __name__ == '__main__':
         else:
             try:
                 status = open_bond_page(tn, branch, from_port, to_port, goods_at, eta, eta_warehouse)
-                errors = status + warning
+                warning_string = ''
+                for warning in warnings:
+                    warning_string += ', ' + warning
+                errors = status + warning_string
                 print('TN# %s contains following errors: %s' % (tn, errors))
                 try:
                     table[

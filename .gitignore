@@ -1,3 +1,7 @@
 .idea/
 venv/
 geckodriver.exe
+geckodriver.log
+tasks.csv
+tasks.xlsx
+report.html
